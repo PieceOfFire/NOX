@@ -1,0 +1,493 @@
+{
+  "format": "nmr-formula-preset",
+  "version": 1,
+  "blocks": [
+    {
+      "id": 1,
+      "kind": "area",
+      "x": 121.0,
+      "y": 348.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 6,
+      "area_number": 7
+    },
+    {
+      "id": 2,
+      "kind": "operation",
+      "x": 525.0,
+      "y": 359.0,
+      "operation": "÷",
+      "value": null,
+      "inputs": [
+        1,
+        3
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 3,
+      "kind": "constant",
+      "x": 125.0,
+      "y": 407.0,
+      "operation": null,
+      "value": 4.0,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 4,
+      "kind": "area",
+      "x": 118.0,
+      "y": 201.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 2,
+      "area_number": 3
+    },
+    {
+      "id": 5,
+      "kind": "area",
+      "x": 108.0,
+      "y": 252.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 5,
+      "area_number": 6
+    },
+    {
+      "id": 6,
+      "kind": "operation",
+      "x": 211.0,
+      "y": 221.0,
+      "operation": "+",
+      "value": null,
+      "inputs": [
+        4,
+        5
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 7,
+      "kind": "operation",
+      "x": 533.0,
+      "y": 250.0,
+      "operation": "÷",
+      "value": null,
+      "inputs": [
+        6,
+        8
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 8,
+      "kind": "constant",
+      "x": 204.0,
+      "y": 307.0,
+      "operation": null,
+      "value": 8.0,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 9,
+      "kind": "area",
+      "x": 132.0,
+      "y": 10.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 0,
+      "area_number": 1
+    },
+    {
+      "id": 10,
+      "kind": "operation",
+      "x": 544.0,
+      "y": 34.0,
+      "operation": "÷",
+      "value": null,
+      "inputs": [
+        9,
+        11
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 11,
+      "kind": "constant",
+      "x": 124.0,
+      "y": 81.0,
+      "operation": null,
+      "value": 2.0,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 12,
+      "kind": "area",
+      "x": 115.0,
+      "y": 464.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 1,
+      "area_number": 2
+    },
+    {
+      "id": 13,
+      "kind": "area",
+      "x": 115.0,
+      "y": 516.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 4,
+      "area_number": 5
+    },
+    {
+      "id": 14,
+      "kind": "operation",
+      "x": 201.0,
+      "y": 468.0,
+      "operation": "+",
+      "value": null,
+      "inputs": [
+        12,
+        13
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 15,
+      "kind": "area",
+      "x": 119.0,
+      "y": 581.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 3,
+      "area_number": 4
+    },
+    {
+      "id": 16,
+      "kind": "operation",
+      "x": 208.0,
+      "y": 591.0,
+      "operation": "−",
+      "value": null,
+      "inputs": [
+        15,
+        18
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 17,
+      "kind": "area",
+      "x": 57.0,
+      "y": 635.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 0,
+      "area_number": 1
+    },
+    {
+      "id": 18,
+      "kind": "operation",
+      "x": 112.0,
+      "y": 652.0,
+      "operation": "×",
+      "value": null,
+      "inputs": [
+        17,
+        19
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 19,
+      "kind": "constant",
+      "x": 23.0,
+      "y": 690.0,
+      "operation": null,
+      "value": 2.0,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 20,
+      "kind": "area",
+      "x": 46.0,
+      "y": 835.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 6,
+      "area_number": 7
+    },
+    {
+      "id": 21,
+      "kind": "area",
+      "x": 129.0,
+      "y": 758.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false,
+      "area_index": 7,
+      "area_number": 8
+    },
+    {
+      "id": 22,
+      "kind": "operation",
+      "x": 217.0,
+      "y": 765.0,
+      "operation": "−",
+      "value": null,
+      "inputs": [
+        21,
+        23
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 23,
+      "kind": "operation",
+      "x": 106.0,
+      "y": 845.0,
+      "operation": "×",
+      "value": null,
+      "inputs": [
+        20,
+        24
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 24,
+      "kind": "constant",
+      "x": 10.0,
+      "y": 888.0,
+      "operation": null,
+      "value": 1.5,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 25,
+      "kind": "operation",
+      "x": 307.0,
+      "y": 651.0,
+      "operation": "+",
+      "value": null,
+      "inputs": [
+        16,
+        22
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 26,
+      "kind": "operation",
+      "x": 419.0,
+      "y": 559.0,
+      "operation": "+",
+      "value": null,
+      "inputs": [
+        14,
+        25
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 27,
+      "kind": "operation",
+      "x": 537.0,
+      "y": 575.0,
+      "operation": "÷",
+      "value": null,
+      "inputs": [
+        26,
+        28
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 28,
+      "kind": "constant",
+      "x": 423.0,
+      "y": 651.0,
+      "operation": null,
+      "value": 8.0,
+      "inputs": [],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 29,
+      "kind": "operation",
+      "x": 638.0,
+      "y": 313.0,
+      "operation": "+",
+      "value": null,
+      "inputs": [
+        7,
+        2
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 30,
+      "kind": "operation",
+      "x": 746.0,
+      "y": 474.0,
+      "operation": "+",
+      "value": null,
+      "inputs": [
+        29,
+        27
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 31,
+      "kind": "operation",
+      "x": 953.0,
+      "y": 453.0,
+      "operation": "+",
+      "value": null,
+      "inputs": [
+        10,
+        30
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 32,
+      "kind": "operation",
+      "x": 1131.0,
+      "y": 579.0,
+      "operation": "÷",
+      "value": null,
+      "inputs": [
+        30,
+        31
+      ],
+      "input": null,
+      "name": "",
+      "auto_name": false
+    },
+    {
+      "id": 33,
+      "kind": "output",
+      "x": 1275.0,
+      "y": 584.0,
+      "operation": null,
+      "value": null,
+      "inputs": [],
+      "input": 32,
+      "name": "Вывод",
+      "auto_name": true
+    }
+  ],
+  "wire_routes": [],
+  "comments": [
+    {
+      "x": 193.0,
+      "y": 38.0,
+      "text": "бутадиен"
+    },
+    {
+      "x": 193.0,
+      "y": 169.0,
+      "text": "бутен-2"
+    },
+    {
+      "x": 166.0,
+      "y": 356.0,
+      "text": "бутан"
+    },
+    {
+      "x": 177.0,
+      "y": 540.0,
+      "text": "бутен-1"
+    }
+  ]
+}

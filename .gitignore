@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Локальная среда и временные файлы
+.venv/
+venv/
+*.log
+
+# Сырые Bruker-спектры и локальные результаты обработки
+/[0-9]*/
+/*_propyn/
+*.nmrproj.json
+
+# Настройки редакторов и ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
