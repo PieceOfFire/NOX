@@ -13,6 +13,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 
+from alignment import AlignmentError, find_x_shift
 from base_line import (
     arpls_baseline, auto_parameters, auto_phase_parameters, fit_lorentzian_peak, load_bruker_spectrum,
     lorentzian_component, peak_polarity, phase_correct, spline_baseline,
@@ -213,6 +214,7 @@ class SpectrumApp(_RootWindow):
             self.integral_table.column(column, width=widths[column], anchor="center")
         self.integral_table.pack(fill="both", expand=True)
         self.integral_table.bind("<Button-3>", self.integral_table_menu)
+        self.integral_table.bind("<Control-KeyPress>", self.copy_integral_table_shortcut)
         self.build_formula_workspace()
 
     def build_application_menu(self) -> None:
@@ -252,6 +254,7 @@ class SpectrumApp(_RootWindow):
         processing_menu.add_separator()
         processing_menu.add_command(label="Интегрирование", command=self.toggle_integration)
         processing_menu.add_command(label="Вывести несколько…", command=self.open_comparison_dialog)
+        processing_menu.add_command(label="Автоматически выровнять по X", command=self.auto_align_comparison)
         processing_menu.add_command(label="Сдвинуть спектр по X…", command=self.shift_comparison_spectrum)
         menu_bar.add_cascade(label="Обработка сигналов", menu=processing_menu)
         self.configure(menu=menu_bar)
@@ -583,12 +586,32 @@ class SpectrumApp(_RootWindow):
         self._redo_stack.clear()
         self.trim_history()
 
+    def remember_comparison_offsets(self, comparison: dict[str, object], action: str) -> None:
+        """Сохранить X-сдвиги сравнения, чтобы автовыравнивание отменялось через Ctrl+Z."""
+        comparison_id = comparison.get("id", self.current_comparison_id)
+        if not isinstance(comparison_id, int):
+            return
+        previous = {
+            "comparison_id": comparison_id,
+            "offsets": dict(comparison.get("offsets", {})),
+        }
+        self._undo_stack.append(("comparison_offsets", action, previous))
+        self._redo_stack.clear()
+        self.trim_history()
+
     @staticmethod
     def comparison_integral_state(comparison: dict[str, object]) -> dict[str, object]:
         return {
             "comparison_id": comparison.get("id"),
             "integrals": [dict(item) for item in comparison.get("integrals", [])],
             "next_integral_id": int(comparison.get("next_integral_id", 1)),
+        }
+
+    @staticmethod
+    def comparison_offset_state(comparison: dict[str, object]) -> dict[str, object]:
+        return {
+            "comparison_id": comparison.get("id"),
+            "offsets": dict(comparison.get("offsets", {})),
         }
 
     def restore_comparison_integral_state(self, state: dict[str, object]) -> bool:
@@ -598,6 +621,15 @@ class SpectrumApp(_RootWindow):
             return False
         comparison["integrals"] = [dict(item) for item in state.get("integrals", [])]
         comparison["next_integral_id"] = int(state.get("next_integral_id", 1))
+        return True
+
+    def restore_comparison_offset_state(self, state: dict[str, object]) -> bool:
+        comparison_id = state.get("comparison_id")
+        comparison = self.comparisons.get(comparison_id) if isinstance(comparison_id, int) else None
+        offsets = state.get("offsets")
+        if comparison is None or not isinstance(offsets, dict):
+            return False
+        comparison["offsets"] = dict(offsets)
         return True
 
     def restore_spectrum_state(self, state: dict[str, object]) -> None:
@@ -626,6 +658,10 @@ class SpectrumApp(_RootWindow):
             comparison_id = target.get("comparison_id")
             comparison = self.comparisons.get(comparison_id) if isinstance(comparison_id, int) else None
             return self.comparison_integral_state(comparison) if comparison is not None else None
+        if kind == "comparison_offsets":
+            comparison_id = target.get("comparison_id")
+            comparison = self.comparisons.get(comparison_id) if isinstance(comparison_id, int) else None
+            return self.comparison_offset_state(comparison) if comparison is not None else None
         return None
 
     def apply_history_state(self, kind: str, state: dict[str, object]) -> bool:
@@ -635,6 +671,12 @@ class SpectrumApp(_RootWindow):
             return True
         if kind == "comparison_integrals":
             if not self.restore_comparison_integral_state(state):
+                return False
+            if self.current_comparison_id == state.get("comparison_id"):
+                self.draw_comparison()
+            return True
+        if kind == "comparison_offsets":
+            if not self.restore_comparison_offset_state(state):
                 return False
             if self.current_comparison_id == state.get("comparison_id"):
                 self.draw_comparison()
@@ -1172,6 +1214,84 @@ class SpectrumApp(_RootWindow):
             return
         ShiftSpectrumDialog(self, comparison)
 
+    def auto_align_comparison(self) -> bool:
+        """Совместить все линии обзора с первым спектром по текущему окну X.
+
+        На полном спектре метод использует все общие пики. Если нужна привязка
+        к одному конкретному сигналу, сначала увеличьте его колёсиком и затем
+        запустите эту команду: границы текущего окна сохраняются.
+        """
+        comparison = self.comparison_record()
+        if comparison is None:
+            messagebox.showinfo(
+                "Автовыравнивание по X", "Сначала откройте график «Сравнение» слева.", parent=self,
+            )
+            return False
+        spectrum_ids = [int(value) for value in comparison.get("spectrum_ids", []) if int(value) in self.spectra]
+        if len(spectrum_ids) < 2:
+            messagebox.showinfo(
+                "Автовыравнивание по X", "Для выравнивания нужны как минимум два спектра.", parent=self,
+            )
+            return False
+
+        reference_id = spectrum_ids[0]
+        reference = self.spectra[reference_id]
+        offsets = comparison.setdefault("offsets", {})
+        reference_offset = float(offsets.get(reference_id, offsets.get(str(reference_id), 0.0)))
+        shown_left, shown_right = sorted(self.axes.get_xlim())
+        # Окно на графике выражено уже в отображаемой системе p + offset.
+        # Алгоритм получает исходную ось опорного спектра.
+        raw_left, raw_right = shown_left - reference_offset, shown_right - reference_offset
+        proposed = {reference_id: reference_offset}
+        aligned: list[tuple[str, float, float]] = []
+        failures: list[str] = []
+
+        for spectrum_id in spectrum_ids[1:]:
+            record = self.spectra[spectrum_id]
+            try:
+                result = find_x_shift(
+                    np.asarray(reference["ppm"]), self.record_signal(reference),
+                    np.asarray(record["ppm"]), self.record_signal(record),
+                    raw_left, raw_right,
+                )
+            except AlignmentError as error:
+                failures.append(f"{record['name']}: {error}")
+                continue
+            proposed[spectrum_id] = reference_offset + result.shift
+            aligned.append((str(record["name"]), result.shift, result.correlation))
+
+        if not aligned:
+            messagebox.showwarning(
+                "Автовыравнивание по X",
+                "Ни один спектр не удалось совместить с опорным.\n\n" + "\n".join(failures[:4]),
+                parent=self,
+            )
+            return False
+
+        changed = any(
+            not np.isclose(float(offsets.get(spectrum_id, offsets.get(str(spectrum_id), 0.0))), offset,
+                          atol=5e-7)
+            for spectrum_id, offset in proposed.items()
+        )
+        if changed:
+            self.remember_comparison_offsets(comparison, "автовыравнивание спектров по X")
+            offsets.update(proposed)
+            self.draw_comparison()
+
+        average = float(np.mean([score for _name, _shift, score in aligned]))
+        self.status.set(
+            f"Автовыравнивание: совмещено {len(aligned)} из {len(spectrum_ids) - 1}; "
+            f"средняя корреляция {average:.3f}. Ctrl+Z отменит сдвиги."
+        )
+        if failures:
+            messagebox.showwarning(
+                "Автовыравнивание по X",
+                "Часть спектров не удалось совместить автоматически:\n\n" + "\n".join(failures[:6])
+                + "\n\nОстальные линии уже выровнены; проблемные можно довести вручную.",
+                parent=self,
+            )
+        return changed
+
     def create_span_selector(self) -> None:
         """Создать выделение заново: ``axes.clear()`` удаляет его художники."""
         if self.span is not None:
@@ -1584,6 +1704,34 @@ class SpectrumApp(_RootWindow):
         if hasattr(self, "formula_canvas"):
             self.refresh_formula_workspace()
 
+    def copy_treeview_rows(self, table: ttk.Treeview, *, context: str) -> bool:
+        """Скопировать выделенные строки Treeview либо всю таблицу в TSV для Excel."""
+        row_ids = list(table.selection()) or list(table.get_children())
+        columns = tuple(str(column) for column in table.cget("columns"))
+        if not row_ids or not columns:
+            return False
+        header = [str(table.heading(column, "text")) for column in columns]
+        rows = ["\t".join(str(value) for value in table.item(row_id, "values")) for row_id in row_ids]
+        self.clipboard_clear()
+        self.clipboard_append("\r\n".join(("\t".join(header), *rows)))
+        amount = f"выделенных строк: {len(row_ids)}" if table.selection() else f"строк: {len(row_ids)}"
+        if context == "formula":
+            self.formula_status.set(f"Таблица результатов скопирована в буфер ({amount}).")
+        else:
+            self.status.set(f"Таблица интегралов скопирована в буфер ({amount}).")
+        return True
+
+    def copy_integral_table(self, _event=None) -> str:
+        """Кнопка и Ctrl+C для таблицы обычных либо общих интегралов."""
+        if not self.copy_treeview_rows(self.integral_table, context="integrals"):
+            self.status.set("В таблице интегралов пока нет данных для копирования.")
+        return "break"
+
+    def copy_integral_table_shortcut(self, event) -> str | None:
+        keysym = str(getattr(event, "keysym", "")).lower()
+        is_c_key = keysym in {"c", "cyrillic_es", "с"} or int(getattr(event, "keycode", -1)) == 67
+        return self.copy_integral_table(event) if is_c_key else None
+
     def integral_table_menu(self, event) -> str:
         """Контекстное меню строки таблицы; номер не связан с внутренним ID."""
         row_id = self.integral_table.identify_row(event.y)
@@ -1902,6 +2050,7 @@ class SpectrumApp(_RootWindow):
         result_scroll.configure(command=self.result_canvas.yview)
         self.result_panel = tk.Frame(self.result_canvas, bg="#ffffff")
         self._result_panel_window = self.result_canvas.create_window((0, 0), window=self.result_panel, anchor="nw")
+        self.formula_results_table: ttk.Treeview | None = None
         self.result_panel.bind("<Configure>", self.update_result_scrollregion)
         self.result_canvas.bind("<Configure>", self.resize_result_panel)
         self.result_canvas.bind("<MouseWheel>", self.scroll_result_panel)
@@ -3807,6 +3956,7 @@ class SpectrumApp(_RootWindow):
             return
         for child in self.result_panel.winfo_children():
             child.destroy()
+        self.formula_results_table = None
         outputs = [(block_id, block) for block_id, block in self.formula_blocks.items() if block["kind"] == "output"]
         if not outputs:
             tk.Label(self.result_panel, text="Добавьте блок\n«Карточка результата»", bg="#ffffff",
@@ -3844,11 +3994,13 @@ class SpectrumApp(_RootWindow):
                           padx=4, pady=1).pack(side="right")
 
         if multi_result:
-            tk.Label(self.result_panel, text="Результаты по спектрам", bg="#ffffff", fg="#536171",
-                     font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 4))
+            result_header = tk.Frame(self.result_panel, bg="#ffffff")
+            result_header.pack(fill="x", pady=(0, 4))
+            tk.Label(result_header, text="Результаты по спектрам", bg="#ffffff", fg="#536171",
+                     font=("Segoe UI", 9, "bold")).pack(side="left")
             columns = tuple(f"out_{block_id}" for block_id, _block in outputs)
             table = ttk.Treeview(self.result_panel, columns=("spectrum",) + columns, show="headings",
-                                 height=min(6, len(comparison_spectrum_ids)))
+                                 height=min(6, len(comparison_spectrum_ids)), selectmode="extended")
             table.heading("spectrum", text="Спектр")
             table.column("spectrum", width=105, anchor="w", stretch=True)
             for number, (block_id, block) in enumerate(outputs, start=1):
@@ -3862,6 +4014,8 @@ class SpectrumApp(_RootWindow):
                 values.extend(self.format_formula_value(self.formula_value_for_record(block_id, record))
                               for block_id, _block in outputs)
                 table.insert("", "end", values=values)
+            self.formula_results_table = table
+            table.bind("<Control-KeyPress>", self.copy_formula_results_table_shortcut)
             table.pack(fill="x", pady=(0, 4))
 
     def copy_formula_value(self, value: float | None) -> None:
@@ -3869,6 +4023,18 @@ class SpectrumApp(_RootWindow):
             return
         self.clipboard_clear()
         self.clipboard_append(self.format_formula_value(value))
+
+    def copy_formula_results_table(self, _event=None) -> str:
+        """Скопировать результаты формулы по спектрам в Excel-совместимый TSV."""
+        table = self.formula_results_table
+        if table is None or not self.copy_treeview_rows(table, context="formula"):
+            self.formula_status.set("Таблица результатов по спектрам пока не построена.")
+        return "break"
+
+    def copy_formula_results_table_shortcut(self, event) -> str | None:
+        keysym = str(getattr(event, "keysym", "")).lower()
+        is_c_key = keysym in {"c", "cyrillic_es", "с"} or int(getattr(event, "keycode", -1)) == 67
+        return self.copy_formula_results_table(event) if is_c_key else None
 
     def on_plot_click(self, event) -> None:
         if event.button != 3 or event.xdata is None:

@@ -23,7 +23,7 @@ class ShiftSpectrumDialog(tk.Toplevel):
     """Точная интерактивная подстройка положения записи на графике сравнения."""
 
     FINE_STEP = .0001
-    SLIDER_SPAN = .05
+    DRAG_STEP = .0002
 
     def __init__(self, app: SpectrumApp, comparison: dict[str, object]) -> None:
         super().__init__(app)
@@ -45,7 +45,8 @@ class ShiftSpectrumDialog(tk.Toplevel):
         self.selected_id = tk.IntVar(value=initial_id)
         self.offset = tk.DoubleVar()
         self.value_text = tk.StringVar()
-        self._updating = False
+        self.drag_start_x: int | None = None
+        self.drag_start_offset = 0.0
 
         frame = tk.Frame(self, padx=14, pady=12)
         frame.pack(fill="both", expand=True)
@@ -60,20 +61,21 @@ class ShiftSpectrumDialog(tk.Toplevel):
 
         tk.Label(frame, text="Точная подстройка химического сдвига", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
         tk.Label(frame, textvariable=self.value_text, fg="#185fa5", font=("TkDefaultFont", 12, "bold")).pack(pady=(3, 4))
-        self.slider = tk.Scale(
-            frame, orient="horizontal", showvalue=False, resolution=self.FINE_STEP,
-            length=430, variable=self.offset, command=self.slide,
-            highlightthickness=0,
+        self.pad = tk.Canvas(
+            frame, width=430, height=124, bg="#f2f5f8", highlightthickness=1,
+            highlightbackground="#98a5b3", cursor="sb_h_double_arrow",
         )
-        self.slider.pack(fill="x")
-        self.slider.bind("<Left>", lambda _event: self.nudge(-self.FINE_STEP))
-        self.slider.bind("<Right>", lambda _event: self.nudge(self.FINE_STEP))
-        self.slider.bind("<MouseWheel>", self.on_mousewheel)
-        tk.Label(
-            frame,
-            text="Перетаскивайте бегунок для грубой настройки. Стрелки клавиатуры и колесо — шаг 0.0001 ppm.",
-            justify="left", fg="#68707d", wraplength=430,
-        ).pack(anchor="w", pady=(4, 0))
+        self.pad.pack(fill="x")
+        self.pad.create_text(215, 43, text="Тяните мышь влево или вправо", fill="#384656",
+                             font=("TkDefaultFont", 12))
+        self.pad.create_text(215, 76, text="Можно отпускать и тянуть снова — диапазон не ограничен", fill="#68707d",
+                             font=("TkDefaultFont", 9))
+        self.pad.bind("<ButtonPress-1>", self.start_drag)
+        self.pad.bind("<B1-Motion>", self.drag)
+        self.pad.bind("<ButtonRelease-1>", self.stop_drag)
+        self.pad.bind("<MouseWheel>", self.on_mousewheel)
+        self.pad.bind("<Left>", lambda _event: self.nudge(-self.FINE_STEP))
+        self.pad.bind("<Right>", lambda _event: self.nudge(self.FINE_STEP))
 
         fine = tk.Frame(frame)
         fine.pack(pady=(10, 0))
@@ -82,69 +84,65 @@ class ShiftSpectrumDialog(tk.Toplevel):
             tk.Button(fine, text=text, width=9, command=lambda value=delta: self.nudge(value)).pack(
                 side="left", padx=2
             )
-        tk.Button(frame, text="Центрировать бегунок", command=self.recenter).pack(pady=(8, 0))
-
         buttons = tk.Frame(frame)
         buttons.pack(fill="x", pady=(12, 0))
         tk.Button(buttons, text="Готово", command=self.accept).pack(side="right")
         tk.Button(buttons, text="Отмена", command=self.cancel).pack(side="right", padx=(0, 6))
         self.protocol("WM_DELETE_WINDOW", self.cancel)
-        self.configure_slider()
-        self.slider.focus_set()
+        self.configure_offset()
+        self.pad.focus_set()
 
     def current_id(self) -> int:
         return self.spectrum_ids[self.spectrum_box.current()]
 
-    def configure_slider(self) -> None:
+    def configure_offset(self) -> None:
         spectrum_id = self.current_id()
         self.selected_id.set(spectrum_id)
         current = float(self.comparison.get("offsets", {}).get(spectrum_id, 0.0))
-        self._updating = True
-        self.slider.configure(from_=current - self.SLIDER_SPAN, to=current + self.SLIDER_SPAN)
         self.offset.set(current)
-        self._updating = False
         self.update_value_text(current)
 
     def select_spectrum(self, _event=None) -> None:
-        self.configure_slider()
-        self.slider.focus_set()
+        self.configure_offset()
+        self.pad.focus_set()
 
     def update_value_text(self, value: float) -> None:
         name = str(self.app.spectra[self.current_id()]["name"])
         self.value_text.set(f"{name}: {value:+.5f} ppm")
 
-    def slide(self, value: str) -> None:
-        if self._updating:
-            return
+    def set_offset(self, value: float) -> None:
         offset = round(float(value), 5)
         spectrum_id = self.current_id()
         offsets = self.comparison.setdefault("offsets", {})
         if np.isclose(float(offsets.get(spectrum_id, 0.0)), offset, atol=5e-8):
+            self.offset.set(offset)
             self.update_value_text(offset)
             return
         offsets[spectrum_id] = offset
+        self.offset.set(offset)
         self.update_value_text(offset)
         self.app.draw_comparison()
 
+    def start_drag(self, event) -> None:
+        self.drag_start_x = event.x
+        self.drag_start_offset = float(self.offset.get())
+
+    def drag(self, event) -> None:
+        if self.drag_start_x is None:
+            return
+        self.set_offset(self.drag_start_offset + (event.x - self.drag_start_x) * self.DRAG_STEP)
+
+    def stop_drag(self, _event) -> None:
+        self.drag_start_x = None
+
     def nudge(self, delta: float):
-        value = round(float(self.offset.get()) + delta, 5)
-        lower, upper = float(self.slider.cget("from")), float(self.slider.cget("to"))
-        if value < lower or value > upper:
-            self.recenter()
-        self.offset.set(value)
-        self.slide(str(value))
+        self.set_offset(float(self.offset.get()) + delta)
         return "break"
 
     def on_mousewheel(self, event):
         if event.delta:
             return self.nudge(self.FINE_STEP if event.delta > 0 else -self.FINE_STEP)
         return "break"
-
-    def recenter(self) -> None:
-        current = float(self.offset.get())
-        self._updating = True
-        self.slider.configure(from_=current - self.SLIDER_SPAN, to=current + self.SLIDER_SPAN)
-        self._updating = False
 
     def accept(self) -> None:
         spectrum_id = self.current_id()
