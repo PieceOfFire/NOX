@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import copy
 import json
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -430,7 +431,7 @@ class SpectrumApp(_RootWindow):
         elif item_id in self.comparisons:
             self.save_active_spectrum()
             self.current_comparison_id = item_id
-            self.clear_history()
+            self.clear_history(preserve_formulas=True)
             self.refresh_spectrum_library()
             self.draw_comparison(reset_x=True, reset_y=True)
             self.status.set(f"Открыто {self.comparisons[item_id]['name']}.")
@@ -443,7 +444,7 @@ class SpectrumApp(_RootWindow):
         self.current_comparison_id = None
         self._comparison_axes = []
         self.restore_active_spectrum(spectrum_id)
-        self.clear_history()
+        self.clear_history(preserve_formulas=True)
         self.refresh_spectrum_library()
         self.draw(reset_x=True, reset_y=True)
         self.status.set(f"Открыт спектр: {self.spectra[spectrum_id]['name']}.")
@@ -548,8 +549,12 @@ class SpectrumApp(_RootWindow):
             return True
         return before is not None and not np.array_equal(np.asarray(before), self.corrected)
 
-    def clear_history(self) -> None:
-        """Смена спектра/проекта не должна смешивать независимые истории."""
+    def clear_history(self, *, preserve_formulas: bool = False) -> None:
+        """Очистить историю спектра; при переключении строк сохранить историю схемы."""
+        if preserve_formulas:
+            self._undo_stack[:] = [item for item in self._undo_stack if item[0] == "formula"]
+            self._redo_stack[:] = [item for item in self._redo_stack if item[0] == "formula"]
+            return
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -598,6 +603,63 @@ class SpectrumApp(_RootWindow):
         self._undo_stack.append(("comparison_offsets", action, previous))
         self._redo_stack.clear()
         self.trim_history()
+
+    def capture_formula_state(self) -> dict[str, object]:
+        """Снимок схемы формулы для общей истории Ctrl+Z / Ctrl+Shift+Z.
+
+        Формулы не зависят от выбранного спектра, поэтому их нельзя хранить в
+        снимке спектра. Отдельный снимок также сохраняет ручные маршруты
+        проводов, комментарии и фреймы — отмена возвращает именно ту схему,
+        которую видел пользователь.
+        """
+        return {
+            "blocks": copy.deepcopy(getattr(self, "formula_blocks", {})),
+            "next_formula_id": int(getattr(self, "_next_formula_id", 1)),
+            "comments": copy.deepcopy(getattr(self, "formula_comments", {})),
+            "next_comment_id": int(getattr(self, "_next_formula_comment_id", 1)),
+            "frames": copy.deepcopy(getattr(self, "formula_frames", {})),
+            "next_frame_id": int(getattr(self, "_next_formula_frame_id", 1)),
+            "wire_routes": copy.deepcopy(getattr(self, "wire_routes", {})),
+            "selection": sorted(getattr(self, "selected_formula_blocks", set())),
+        }
+
+    def formula_state_changed(self, previous: dict[str, object]) -> bool:
+        return previous != self.capture_formula_state()
+
+    def remember_formula_state(self, previous: dict[str, object], action: str) -> None:
+        """Добавить одно законченное действие редактора формул в историю."""
+        if not self.formula_state_changed(previous):
+            return
+        self._undo_stack.append(("formula", action, previous))
+        self._redo_stack.clear()
+        self.trim_history()
+
+    def restore_formula_state(self, state: dict[str, object]) -> bool:
+        try:
+            raw_blocks = state["blocks"]
+            raw_comments = state["comments"]
+            raw_frames = state["frames"]
+            raw_routes = state["wire_routes"]
+            if not all(isinstance(value, dict) for value in (raw_blocks, raw_comments, raw_frames, raw_routes)):
+                return False
+            self.formula_blocks = copy.deepcopy(raw_blocks)
+            self._next_formula_id = int(state.get("next_formula_id", 1))
+            self.formula_comments = copy.deepcopy(raw_comments)
+            self._next_formula_comment_id = int(state.get("next_comment_id", 1))
+            self.formula_frames = copy.deepcopy(raw_frames)
+            self._next_formula_frame_id = int(state.get("next_frame_id", 1))
+            self.wire_routes = copy.deepcopy(raw_routes)
+            self.selected_formula_blocks = {
+                int(value) for value in state.get("selection", [])
+                if isinstance(value, int) and value in self.formula_blocks
+            }
+        except (KeyError, TypeError, ValueError):
+            return False
+        self.cleanup_formula_frames()
+        self.cleanup_wire_routes()
+        self.renumber_formula_outputs()
+        self.refresh_formula_workspace()
+        return True
 
     @staticmethod
     def comparison_integral_state(comparison: dict[str, object]) -> dict[str, object]:
@@ -662,6 +724,8 @@ class SpectrumApp(_RootWindow):
             comparison_id = target.get("comparison_id")
             comparison = self.comparisons.get(comparison_id) if isinstance(comparison_id, int) else None
             return self.comparison_offset_state(comparison) if comparison is not None else None
+        if kind == "formula":
+            return self.capture_formula_state()
         return None
 
     def apply_history_state(self, kind: str, state: dict[str, object]) -> bool:
@@ -681,10 +745,12 @@ class SpectrumApp(_RootWindow):
             if self.current_comparison_id == state.get("comparison_id"):
                 self.draw_comparison()
             return True
+        if kind == "formula":
+            return self.restore_formula_state(state)
         return False
 
     def undo_last_action(self, _event: object | None = None) -> str:
-        """Отменить последнее действие над спектром либо общим интегралом."""
+        """Отменить последнее действие над спектром, сравнением или схемой формулы."""
         if self._spectrum_dialog_open:
             return "break"
         if not self._undo_stack:
@@ -698,11 +764,14 @@ class SpectrumApp(_RootWindow):
         self._redo_stack.append((kind, action, current))
         self.trim_history()
         self.after_idle(self.restore_interaction_mode)
-        self.status.set(f"Отменено: {action}.")
+        message = f"Отменено: {action}."
+        self.status.set(message)
+        if kind == "formula" and hasattr(self, "formula_status"):
+            self.formula_status.set(message)
         return "break"
 
     def redo_last_action(self, _event: object | None = None) -> str:
-        """Вернуть действие, отменённое через Ctrl+Z."""
+        """Вернуть действие над спектром, сравнением или схемой формулы."""
         if self._spectrum_dialog_open:
             return "break"
         if not self._redo_stack:
@@ -716,7 +785,10 @@ class SpectrumApp(_RootWindow):
         self._undo_stack.append((kind, action, current))
         self.trim_history()
         self.after_idle(self.restore_interaction_mode)
-        self.status.set(f"Повторено: {action}.")
+        message = f"Повторено: {action}."
+        self.status.set(message)
+        if kind == "formula" and hasattr(self, "formula_status"):
+            self.formula_status.set(message)
         return "break"
 
     @staticmethod
@@ -1964,61 +2036,90 @@ class SpectrumApp(_RootWindow):
     _OPERATION_NAMES = ("+", "−", "×", "÷", "^", "%", "abs", "√", "ln", "log₁₀", "exp", "round", "−x", "min", "max")
 
     def build_formula_workspace(self) -> None:
-        """Создать аккуратную Scratch-подобную вкладку для живых расчётов."""
-        header = tk.Frame(self.formula_tab, bg="#ffffff", padx=14, pady=10)
+        """Создать визуальный редактор расчётов с акцентом на схему, а не на окна."""
+        self.formula_theme = {
+            "ink": "#162033", "muted": "#6b778b", "page": "#e8eef7",
+            "panel": "#ffffff", "toolbar": "#f5f8fc", "line": "#dce5f0",
+            "primary": "#2563eb", "primary_dark": "#173f90", "green": "#2e9d67",
+            "green_dark": "#197a4d", "violet": "#7657e8", "amber": "#f59e0b",
+            "danger": "#dc4c64", "header": "#101b32",
+        }
+        self.configure_formula_styles()
+        header = tk.Frame(self.formula_tab, bg=self.formula_theme["header"], padx=18, pady=12)
         header.pack(fill="x")
-        tk.Label(header, text="Визуальные формулы", font=("Segoe UI", 14, "bold"), bg="#ffffff").pack(side="left")
-        tk.Button(header, text="Загрузить пресет…", command=self.load_formula_preset).pack(side="right")
-        tk.Button(header, text="Сохранить пресет…", command=self.save_formula_preset).pack(side="right", padx=(0, 6))
-        self.formula_status = tk.StringVar(
-            value="Тяните провод от оранжевого выхода к синему входу; пустой фон перемещает поле."
+        title_group = tk.Frame(header, bg=self.formula_theme["header"])
+        title_group.pack(side="left")
+        tk.Label(title_group, text="NOX · Формулы", font=("Segoe UI", 16, "bold"),
+                 bg=self.formula_theme["header"], fg="#f8fbff").pack(anchor="w")
+        tk.Label(title_group, text="Визуальный расчёт по интегралам", font=("Segoe UI", 9),
+                 bg=self.formula_theme["header"], fg="#aebdd2").pack(anchor="w", pady=(1, 0))
+        self.formula_health = tk.StringVar(value="Новая схема")
+        self.formula_health_label = tk.Label(
+            header, textvariable=self.formula_health, bg="#1d2c47", fg="#dbeafe",
+            font=("Segoe UI", 9, "bold"), padx=9, pady=5,
         )
-        tk.Label(header, textvariable=self.formula_status, fg="#68707d", bg="#ffffff").pack(side="left", padx=16)
-        layout = tk.Frame(self.formula_tab, bg="#e9edf2", padx=10, pady=10)
+        self.formula_health_label.pack(side="right", padx=(10, 0))
+        self.make_formula_button(header, "Загрузить", self.load_formula_preset, variant="dark").pack(side="right")
+        self.make_formula_button(header, "Сохранить", self.save_formula_preset, variant="primary").pack(side="right", padx=(0, 6))
+        self.formula_status = tk.StringVar(
+            value="Нажмите блок в библиотеке, соедините порты и добавьте карточку результата."
+        )
+        layout = tk.Frame(self.formula_tab, bg=self.formula_theme["page"], padx=12, pady=12)
         layout.pack(fill="both", expand=True)
 
-        palette = tk.LabelFrame(layout, text="  Источники  ", bg="#ffffff", padx=8, pady=8, width=215)
+        palette = tk.LabelFrame(layout, text="  Библиотека  ", bg=self.formula_theme["panel"], fg=self.formula_theme["ink"],
+                                font=("Segoe UI", 10, "bold"), padx=8, pady=8, width=215,
+                                highlightbackground=self.formula_theme["line"], highlightthickness=1, bd=0)
         palette.pack(side="left", fill="y", padx=(0, 10))
         palette.pack_propagate(False)
-        palette_body = tk.Frame(palette, bg="#ffffff")
+        palette_body = tk.Frame(palette, bg=self.formula_theme["panel"])
         palette_body.pack(fill="both", expand=True)
         palette_scroll = tk.Scrollbar(palette_body, orient="vertical")
         palette_scroll.pack(side="right", fill="y")
         self.palette_canvas = tk.Canvas(
-            palette_body, bg="#ffffff", highlightthickness=0, width=195,
+            palette_body, bg=self.formula_theme["panel"], highlightthickness=0, width=195,
             yscrollcommand=palette_scroll.set,
         )
         self.palette_canvas.pack(side="left", fill="both", expand=True)
         palette_scroll.configure(command=self.palette_canvas.yview)
         self.palette_canvas.bind("<MouseWheel>", self.scroll_formula_palette)
 
-        workspace = tk.LabelFrame(layout, text="  Рабочая область  ", bg="#ffffff", padx=0, pady=0)
+        workspace = tk.LabelFrame(layout, text="  Рабочая область  ", bg=self.formula_theme["panel"],
+                                  fg=self.formula_theme["ink"], font=("Segoe UI", 10, "bold"), padx=0, pady=0,
+                                  highlightbackground=self.formula_theme["line"], highlightthickness=1, bd=0)
         workspace.pack(side="left", fill="both", expand=True)
-        toolbar = tk.Frame(workspace, bg="#f5f7fa", padx=8, pady=5)
+        toolbar = tk.Frame(workspace, bg=self.formula_theme["toolbar"], padx=10, pady=7)
         toolbar.pack(fill="x")
-        tk.Label(toolbar, text="Инструменты", bg="#f5f7fa", fg="#536171").pack(side="left", padx=(2, 8))
+        tk.Label(toolbar, text="РЕЖИМ", bg=self.formula_theme["toolbar"], fg="#7a8799",
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(2, 8))
         self.formula_tool_buttons: dict[str, tk.Button] = {}
         for tool, icon, label in (
             ("pan", "✥", "Перемещение поля"),
             ("select", "▣", "Выделение блоков"),
             ("comment", "✎", "Комментарий"),
         ):
-            button = tk.Button(toolbar, text=icon, width=3, relief="flat", bd=1,
+            button = tk.Button(toolbar, text=icon, width=3, relief="flat", bd=0,
+                               font=("Segoe UI Symbol", 10, "bold"),
+                               bg=self.formula_theme["toolbar"], activebackground="#dceafe",
+                               fg="#40516a", cursor="hand2",
                                command=lambda value=tool: self.set_formula_tool(value))
             button.pack(side="left", padx=2)
             self.formula_tool_buttons[tool] = button
             self.add_formula_tooltip(button, label)
-        tk.Button(toolbar, text="Удалить выделенное", command=self.delete_selected_formula_blocks).pack(side="left", padx=(10, 2))
-        tk.Label(toolbar, text="Delete", bg="#f5f7fa", fg="#8b96a3", font=("Segoe UI", 8)).pack(side="left")
-        tk.Button(toolbar, text="Создать фрейм", command=self.create_formula_frame).pack(side="left", padx=(12, 2))
-        workspace_body = tk.Frame(workspace, bg="#ffffff")
+        self.make_formula_button(toolbar, "Удалить", self.delete_selected_formula_blocks, variant="quiet").pack(side="left", padx=(10, 2))
+        tk.Label(toolbar, text="Del", bg=self.formula_theme["toolbar"], fg="#8b96a3", font=("Segoe UI", 8)).pack(side="left")
+        self.make_formula_button(toolbar, "Фрейм", self.create_formula_frame, variant="quiet").pack(side="left", padx=(10, 2))
+        self.make_formula_button(toolbar, "⌖", self.focus_formula_scene, variant="icon").pack(side="right", padx=(4, 0))
+        self.add_formula_tooltip(toolbar.winfo_children()[-1], "Центрировать схему")
+        self.make_formula_button(toolbar, "Снять выбор", self.clear_formula_selection, variant="quiet").pack(side="right")
+        workspace_body = tk.Frame(workspace, bg=self.formula_theme["panel"])
         workspace_body.pack(fill="both", expand=True)
         workspace_body.rowconfigure(0, weight=1)
         workspace_body.columnconfigure(0, weight=1)
         formula_x_scroll = tk.Scrollbar(workspace_body, orient="horizontal")
         formula_y_scroll = tk.Scrollbar(workspace_body, orient="vertical")
         self.formula_canvas = tk.Canvas(
-            workspace_body, bg="#fbfcfe", highlightthickness=0, scrollregion=(0, 0, 1800, 1200),
+            workspace_body, bg="#f9fbfe", highlightthickness=0, scrollregion=(0, 0, 1800, 1200),
             xscrollcommand=formula_x_scroll.set, yscrollcommand=formula_y_scroll.set,
         )
         self.formula_canvas.grid(row=0, column=0, sticky="nsew")
@@ -2032,30 +2133,44 @@ class SpectrumApp(_RootWindow):
         self.formula_canvas.bind("<B1-Motion>", self.drag_formula_pan, add="+")
         self.formula_canvas.bind("<ButtonRelease-1>", self.drop_formula_wire, add="+")
         self.formula_canvas.bind("<ButtonRelease-1>", self.stop_formula_pan, add="+")
-        self.formula_canvas.bind("<Configure>", lambda _event: self.draw_formula_grid())
+        self.formula_canvas.bind("<Configure>", self.on_formula_canvas_configure)
         self.formula_canvas.bind("<Delete>", self.delete_selected_formula_blocks)
         self.formula_canvas.bind("<Escape>", lambda _event: self.clear_formula_selection())
+        self.formula_canvas.bind("<KeyPress-v>", lambda _event: self.set_formula_tool("select") or "break")
+        self.formula_canvas.bind("<KeyPress-V>", lambda _event: self.set_formula_tool("select") or "break")
+        self.formula_canvas.bind("<KeyPress-c>", lambda _event: self.set_formula_tool("comment") or "break")
+        self.formula_canvas.bind("<KeyPress-C>", lambda _event: self.set_formula_tool("comment") or "break")
+        self.formula_canvas.bind("<KeyPress-space>", lambda _event: self.set_formula_tool("pan") or "break")
+        self.formula_canvas.bind("<Home>", lambda _event: self.focus_formula_scene() or "break")
         self._formula_world = (1800.0, 1200.0)
 
-        results = tk.LabelFrame(layout, text="  Результаты  ", bg="#ffffff", padx=8, pady=8, width=220)
+        results = tk.LabelFrame(layout, text="  Результаты  ", bg=self.formula_theme["panel"],
+                                fg=self.formula_theme["ink"], font=("Segoe UI", 10, "bold"), padx=8, pady=8, width=235,
+                                highlightbackground=self.formula_theme["line"], highlightthickness=1, bd=0)
         results.pack(side="right", fill="y", padx=(10, 0))
         results.pack_propagate(False)
-        result_body = tk.Frame(results, bg="#ffffff")
+        result_body = tk.Frame(results, bg=self.formula_theme["panel"])
         result_body.pack(fill="both", expand=True)
         result_scroll = tk.Scrollbar(result_body, orient="vertical")
         result_scroll.pack(side="right", fill="y")
-        self.result_canvas = tk.Canvas(result_body, bg="#ffffff", highlightthickness=0,
+        self.result_canvas = tk.Canvas(result_body, bg=self.formula_theme["panel"], highlightthickness=0,
                                        yscrollcommand=result_scroll.set)
         self.result_canvas.pack(side="left", fill="both", expand=True)
         result_scroll.configure(command=self.result_canvas.yview)
-        self.result_panel = tk.Frame(self.result_canvas, bg="#ffffff")
+        self.result_panel = tk.Frame(self.result_canvas, bg=self.formula_theme["panel"])
         self._result_panel_window = self.result_canvas.create_window((0, 0), window=self.result_panel, anchor="nw")
         self.formula_results_table: ttk.Treeview | None = None
         self.result_panel.bind("<Configure>", self.update_result_scrollregion)
         self.result_canvas.bind("<Configure>", self.resize_result_panel)
         self.result_canvas.bind("<MouseWheel>", self.scroll_result_panel)
-        tk.Label(results, text="Правый клик по рабочей области\nдобавляет блоки.", bg="#ffffff",
-                 fg="#68707d", justify="left").pack(anchor="w", pady=(12, 0))
+        tk.Label(results, text="Ctrl+C — скопировать строки\nиз таблицы результатов.", bg=self.formula_theme["panel"],
+                 fg="#7a8799", justify="left", font=("Segoe UI", 8)).pack(anchor="w", pady=(10, 0))
+
+        status_bar = tk.Frame(self.formula_tab, bg="#f6f8fb", padx=16, pady=6)
+        status_bar.pack(side="bottom", fill="x")
+        tk.Label(status_bar, text="●", bg="#f6f8fb", fg="#5e8cc5", font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Label(status_bar, textvariable=self.formula_status, bg="#f6f8fb", fg="#617086",
+                 anchor="w", font=("Segoe UI", 9)).pack(side="left", padx=(6, 0), fill="x", expand=True)
 
         self.formula_blocks = {}
         self._next_formula_id = 1
@@ -2078,10 +2193,143 @@ class SpectrumApp(_RootWindow):
         self.set_formula_tool("pan")
         self.refresh_formula_workspace()
 
+    def configure_formula_styles(self) -> None:
+        """Локальные стили для табличных результатов редактора формул."""
+        theme = self.formula_theme
+        style = ttk.Style(self)
+        style.configure(
+            "Formula.Treeview", background=theme["panel"], fieldbackground=theme["panel"],
+            foreground=theme["ink"], rowheight=27, borderwidth=0,
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Formula.Treeview.Heading", background="#edf3fa", foreground="#40516a",
+            relief="flat", borderwidth=0, font=("Segoe UI", 8, "bold"), padding=(7, 6),
+        )
+        style.map(
+            "Formula.Treeview", background=[("selected", "#dbeafe")],
+            foreground=[("selected", "#173f90")],
+        )
+
+    def make_formula_button(self, parent: tk.Misc, text: str, command, *, variant: str = "quiet") -> tk.Button:
+        """Единый компактный вид кнопок в рабочем пространстве формул."""
+        theme = self.formula_theme
+        colors = {
+            "primary": (theme["primary"], "#ffffff", "#3b75ec"),
+            "dark": ("#243655", "#e8f0ff", "#31486e"),
+            "quiet": (theme["toolbar"], "#3e5069", "#e5edf7"),
+            "icon": (theme["toolbar"], "#3e5069", "#e5edf7"),
+        }
+        bg, fg, active = colors.get(variant, colors["quiet"])
+        return tk.Button(
+            parent, text=text, command=command, relief="flat", bd=0,
+            padx=8 if variant != "icon" else 6, pady=4 if variant != "icon" else 3,
+            bg=bg, fg=fg, activebackground=active, activeforeground=fg,
+            font=("Segoe UI", 9, "bold" if variant in {"primary", "dark"} else "normal"),
+            cursor="hand2",
+        )
+
+    def focus_formula_scene(self) -> None:
+        """Центрировать вид на содержимом схемы без скрытого ограничения масштаба."""
+        if not hasattr(self, "formula_canvas"):
+            return
+        items: list[tuple[float, float, float, float]] = []
+        for block in self.formula_blocks.values():
+            width, height = self.formula_block_size(block)
+            items.append((float(block["x"]), float(block["y"]), width, height))
+        for frame in self.formula_frames.values():
+            if bool(frame.get("collapsed")):
+                width, height = self.formula_frame_compact_size(frame)
+                items.append((float(frame.get("x", 40.0)), float(frame.get("y", 40.0)), width, height))
+        for comment in self.formula_comments.values():
+            items.append((float(comment["x"]), float(comment["y"]), 170.0, 50.0))
+        if not items:
+            self.formula_canvas.xview_moveto(0.25)
+            self.formula_canvas.yview_moveto(0.18)
+            self.formula_status.set("Схема пока пуста — добавьте блок из библиотеки слева.")
+            return
+        left = min(item[0] for item in items)
+        top = min(item[1] for item in items)
+        right = max(item[0] + item[2] for item in items)
+        bottom = max(item[1] + item[3] for item in items)
+        center_x, center_y = (left + right) / 2, (top + bottom) / 2
+        canvas = self.formula_canvas
+        canvas.update_idletasks()
+        world_width, world_height = self._formula_world
+        visible_width = max(1.0, float(canvas.winfo_width()))
+        visible_height = max(1.0, float(canvas.winfo_height()))
+        target_left = min(max(0.0, center_x - visible_width / 2), max(0.0, world_width - visible_width))
+        target_top = min(max(0.0, center_y - visible_height / 2), max(0.0, world_height - visible_height))
+        canvas.xview_moveto(target_left / world_width)
+        canvas.yview_moveto(target_top / world_height)
+        self.formula_status.set("Рабочая область центрирована на схеме.")
+
+    def formula_block_diagnostic(self, block_id: int) -> tuple[str, str]:
+        """Короткий статус блока для цвета порта, карточек и индикатора сверху."""
+        block = self.formula_blocks.get(block_id)
+        if block is None:
+            return "error", "Блок недоступен"
+        kind = str(block.get("kind"))
+        if kind == "area" and block.get("integral_id") is None:
+            return "warning", f"I{self.formula_area_number(block)} не найден: используется 0"
+        if kind == "operation":
+            inputs = list(block.get("inputs", []))
+            if any(not isinstance(value, int) or value not in self.formula_blocks for value in inputs):
+                return "warning", "Подключите все входы операции"
+            values = [self.formula_value(value) for value in inputs]
+            operation = str(block.get("operation") or "")
+            if any(value is None for value in values):
+                return "error", "Один из входов не удалось вычислить"
+            a = float(values[0])
+            b = float(values[1]) if len(values) > 1 else a
+            if operation in {"÷", "%"} and np.isclose(b, 0.0):
+                return "warning", "Делитель равен 0: результат принят за 0"
+            if operation == "√" and a < 0:
+                return "error", "Корень из отрицательного значения"
+            if operation in {"ln", "log₁₀"} and a <= 0:
+                return "error", "Логарифм определён только для положительного значения"
+        if kind == "output":
+            source_id = block.get("input")
+            if not isinstance(source_id, int) or source_id not in self.formula_blocks:
+                return "warning", "Подключите вход результата"
+        if kind in {"operation", "output"} and self.formula_value(block_id) is None:
+            return "error", "Проверьте операцию и входные значения"
+        return "ready", "Готово"
+
+    def update_formula_health(self) -> None:
+        if not hasattr(self, "formula_health"):
+            return
+        if not self.formula_blocks and not self.formula_comments:
+            text, bg, fg = "Новая схема", "#1d2c47", "#dbeafe"
+        else:
+            diagnostics = [self.formula_block_diagnostic(block_id) for block_id in self.formula_blocks]
+            errors = sum(state == "error" for state, _message in diagnostics)
+            warnings = sum(state == "warning" for state, _message in diagnostics)
+            outputs = sum(block.get("kind") == "output" for block in self.formula_blocks.values())
+            if errors:
+                text, bg, fg = f"{errors} ошибок", "#542332", "#ffd9df"
+            elif warnings:
+                text, bg, fg = f"{warnings} требуют внимания", "#513b17", "#ffe8ad"
+            elif outputs:
+                text, bg, fg = f"Готово · {outputs} вых.", "#174535", "#c8f7de"
+            else:
+                text, bg, fg = "Добавьте вывод", "#273750", "#dbeafe"
+        self.formula_health.set(text)
+        if hasattr(self, "formula_health_label"):
+            self.formula_health_label.configure(bg=bg, fg=fg)
+
     def scroll_formula_palette(self, event) -> str:
         steps = max(1, abs(event.delta) // 120)
         self.palette_canvas.yview_scroll(-steps if event.delta > 0 else steps, "units")
         return "break"
+
+    def on_formula_canvas_configure(self, _event=None) -> None:
+        self.draw_formula_grid()
+        # До первого <Configure> размер Canvas равен 1×1. Перерисовываем
+        # пустое состояние после раскладки, чтобы карточка приветствия не
+        # оказалась в левом верхнем углу.
+        if hasattr(self, "formula_blocks") and not self.formula_blocks and not self.formula_comments:
+            self.render_formula_blocks()
 
     def update_result_scrollregion(self, _event=None) -> None:
         if hasattr(self, "result_canvas"):
@@ -2129,7 +2377,8 @@ class SpectrumApp(_RootWindow):
         }
         for name, button in getattr(self, "formula_tool_buttons", {}).items():
             button.configure(relief="sunken" if name == tool else "flat",
-                             bg="#dcecff" if name == tool else "#f5f7fa")
+                             bg="#dcecff" if name == tool else self.formula_theme["toolbar"],
+                             fg="#1e4fa7" if name == tool else "#40516a")
         if hasattr(self, "formula_status"):
             self.formula_status.set(labels[tool])
         if hasattr(self, "formula_canvas"):
@@ -2193,10 +2442,12 @@ class SpectrumApp(_RootWindow):
         text = simpledialog.askstring("Комментарий", "Текст комментария:", parent=self)
         if not text or not text.strip():
             return
+        previous = self.capture_formula_state()
         comment_id = self._next_formula_comment_id
         self._next_formula_comment_id += 1
         self.formula_comments[comment_id] = {"x": x, "y": y, "text": text.strip()}
         self.render_formula_blocks()
+        self.remember_formula_state(previous, "добавлен комментарий")
 
     def start_formula_comment(self, event) -> None:
         self.add_formula_comment_at(float(self.formula_canvas.canvasx(event.x)), float(self.formula_canvas.canvasy(event.y)))
@@ -2206,6 +2457,7 @@ class SpectrumApp(_RootWindow):
         if not selected:
             self.formula_status.set("Сначала выделите один или несколько блоков рамкой.")
             return "break" if _event is not None else None
+        previous = self.capture_formula_state()
         for block_id in selected:
             self.formula_blocks.pop(block_id, None)
         for block in self.formula_blocks.values():
@@ -2219,6 +2471,7 @@ class SpectrumApp(_RootWindow):
         self.cleanup_wire_routes()
         self.formula_status.set(f"Удалено блоков: {len(selected)}.")
         self.refresh_formula_workspace()
+        self.remember_formula_state(previous, f"удалено блоков: {len(selected)}")
         # Не отдаём событие дальше Tk: это исключает появление меню рабочего
         # поля после нажатия клавиши Delete.
         return "break" if _event is not None else None
@@ -2281,6 +2534,7 @@ class SpectrumApp(_RootWindow):
         name = simpledialog.askstring("Новый фрейм", "Название фрейма:", initialvalue="Расчёт", parent=self)
         if not name or not name.strip():
             return
+        previous = self.capture_formula_state()
         frame_id = self._next_formula_frame_id
         self._next_formula_frame_id += 1
         temporary = {"members": members}
@@ -2298,6 +2552,7 @@ class SpectrumApp(_RootWindow):
         self.selected_formula_blocks.clear()
         self.formula_status.set(f"Создан фрейм «{name.strip()}». ПКМ по его заголовку — настройки и сворачивание.")
         self.render_formula_blocks()
+        self.remember_formula_state(previous, "создан фрейм")
 
     def configure_formula_frame(self, frame_id: int) -> None:
         frame = self.formula_frames.get(frame_id)
@@ -2314,6 +2569,7 @@ class SpectrumApp(_RootWindow):
                                                initialvalue=len(frame.get("outputs", [])), minvalue=1, maxvalue=8, parent=self)
         if output_count is None:
             return
+        previous = self.capture_formula_state()
         frame["name"] = name.strip()
         targets = self.formula_frame_input_targets(frame)
         if input_count > len(targets):
@@ -2347,21 +2603,26 @@ class SpectrumApp(_RootWindow):
             frame["outputs"].append({"name": (port_name or f"Выход {index + 1}").strip(), "source_id": source_id})
         self.cleanup_formula_frames()
         self.render_formula_blocks()
+        self.remember_formula_state(previous, "настроен фрейм")
 
     def toggle_formula_frame(self, frame_id: int) -> None:
         frame = self.formula_frames.get(frame_id)
         if frame is None:
             return
+        previous = self.capture_formula_state()
         if not bool(frame.get("collapsed")):
             x, y, _width, _height = self.formula_frame_bounds(frame)
             frame["x"], frame["y"] = x, y
         frame["collapsed"] = not bool(frame.get("collapsed"))
         self.render_formula_blocks()
+        self.remember_formula_state(previous, "изменён вид фрейма")
 
     def ungroup_formula_frame(self, frame_id: int) -> None:
         if frame_id in self.formula_frames:
+            previous = self.capture_formula_state()
             self.formula_frames.pop(frame_id)
             self.render_formula_blocks()
+            self.remember_formula_state(previous, "разгруппирован фрейм")
 
     def cleanup_formula_frames(self) -> None:
         for frame_id in list(self.formula_frames):
@@ -2555,7 +2816,8 @@ class SpectrumApp(_RootWindow):
             return "break"
         x, y = self.formula_canvas.canvasx(event.x), self.formula_canvas.canvasy(event.y)
         self._formula_drag = None
-        self._frame_drag = {"id": frame_id, "x": float(x), "y": float(y)}
+        self._frame_drag = {"id": frame_id, "x": float(x), "y": float(y),
+                            "history": self.capture_formula_state()}
         return "break"
 
     def drag_formula_frame(self, event) -> str | None:
@@ -2586,8 +2848,11 @@ class SpectrumApp(_RootWindow):
     def drop_formula_frame(self, _event) -> str | None:
         if self._frame_drag is None:
             return None
+        previous = self._frame_drag.get("history")
         self._frame_drag = None
         self.render_formula_blocks()
+        if isinstance(previous, dict):
+            self.remember_formula_state(previous, "перемещён фрейм")
         return "break"
 
     def formula_frame_menu(self, event, frame_id: int) -> str:
@@ -2654,10 +2919,13 @@ class SpectrumApp(_RootWindow):
     def render_formula_palette(self) -> None:
         canvas = self.palette_canvas
         canvas.delete("all")
-        y = 12
-        canvas.create_text(8, y, text="Площади интегралов", anchor="w", fill="#536171",
-                           font=("Segoe UI", 10, "bold"))
-        y += 18
+        theme = self.formula_theme
+        y = 14
+        canvas.create_text(10, y, text="ИНТЕГРАЛЫ", anchor="w", fill="#617086",
+                           font=("Segoe UI", 8, "bold"))
+        canvas.create_text(10, y + 15, text="Нажмите, чтобы добавить источник", anchor="w", fill="#9aa7b8",
+                           font=("Segoe UI", 8))
+        y += 29
         comparison = self.comparison_record()
         source_integrals = (sorted(list(comparison.get("integrals", [])), key=lambda item: int(item["number"]))
                             if comparison is not None else self.ordered_integrals())
@@ -2665,7 +2933,8 @@ class SpectrumApp(_RootWindow):
             number = str(item["number"]) if comparison is not None else self.integral_number(item["id"])
             integral_id, color = int(item["id"]), str(item["color"])
             tag = f"palette_area_{integral_id}"
-            self.rounded_rect(canvas, 8, y, 187, y + 34, 13, fill=color, outline="", tags=(tag,))
+            self.rounded_rect(canvas, 10, y + 2, 187, y + 36, 12, fill="#dce4ef", outline="", tags=("palette_shadow",))
+            self.rounded_rect(canvas, 8, y, 185, y + 34, 12, fill=color, outline="", tags=(tag,))
             canvas.create_text(20, y + 17, text=f"I{number}", anchor="w", fill="white",
                                font=("Segoe UI", 10, "bold"), tags=(tag,))
             if comparison is not None and self.active_spectrum_id in self.spectra:
@@ -2676,28 +2945,30 @@ class SpectrumApp(_RootWindow):
                                                   x_offset=offset)
             else:
                 value = self.integral_area(item)
-            canvas.create_text(174, y + 17, text=self.format_formula_value(value), anchor="e",
+            canvas.create_text(172, y + 17, text=self.format_formula_value(value), anchor="e",
                                fill="white", font=("Consolas", 9, "bold"), tags=(tag,))
             canvas.tag_bind(tag, "<ButtonPress-1>",
                             lambda event, iid=integral_id, num=int(number): self.start_palette_drag(event, iid, num))
             y += 41
         if not source_integrals:
-            canvas.create_text(8, y + 8, text="Сначала выделите интеграл", anchor="w", fill="#98a1aa")
+            canvas.create_text(10, y + 8, text="Сначала выделите интеграл", anchor="w", fill="#98a1aa")
             y += 30
-        canvas.create_line(8, y, 187, y, fill="#e5e9ee")
-        y += 14
-        canvas.create_text(8, y, text="Константы", anchor="w", fill="#536171",
-                           font=("Segoe UI", 10, "bold"))
-        y += 18
+        canvas.create_line(10, y, 185, y, fill=theme["line"])
+        y += 17
+        canvas.create_text(10, y, text="КОНСТАНТЫ", anchor="w", fill="#617086",
+                           font=("Segoe UI", 8, "bold"))
+        y += 17
         action_y = y + 5
-        canvas.create_text(10, action_y + 12, text="＋ Константа", anchor="w", fill="#7b61ff",
-                                          font=("Segoe UI", 10, "bold"), tags=("palette_action", "add_constant"))
+        self.rounded_rect(canvas, 8, action_y, 185, action_y + 30, 10, fill="#f1edff", outline="#ddd5ff",
+                          tags=("palette_action", "add_constant"))
+        canvas.create_text(18, action_y + 15, text="＋  Константа", anchor="w", fill=theme["violet"],
+                           font=("Segoe UI", 10, "bold"), tags=("palette_action", "add_constant"))
         canvas.tag_bind("add_constant", "<ButtonPress-1>", lambda _event: self.add_formula_constant())
         y = action_y + 35
-        canvas.create_line(8, y, 187, y, fill="#e5e9ee")
-        y += 15
-        canvas.create_text(8, y, text="Операторы", anchor="w", fill="#536171", font=("Segoe UI", 10, "bold"))
-        y += 18
+        canvas.create_line(10, y, 185, y, fill=theme["line"])
+        y += 17
+        canvas.create_text(10, y, text="ОПЕРАЦИИ", anchor="w", fill="#617086", font=("Segoe UI", 8, "bold"))
+        y += 17
         for row in (("+", "−"), ("×", "÷"), ("^", "%"), ("abs", "√"),
                     ("ln", "log₁₀"), ("exp", "round"), ("min", "max")):
             for column, operation in enumerate(row):
@@ -2708,30 +2979,33 @@ class SpectrumApp(_RootWindow):
                                 lambda _event, op=operation: self.add_formula_operation_from_palette(op))
             y += 39
         output_tag = "palette_output"
-        self.rounded_rect(canvas, 8, y, 187, y + 32, 13, fill="#3d7ea6", outline="", tags=(output_tag,))
-        canvas.create_text(20, y + 16, text="＋ Карточка результата", anchor="w", fill="white",
+        self.rounded_rect(canvas, 10, y + 2, 187, y + 34, 12, fill="#dce4ef", outline="", tags=("palette_shadow",))
+        self.rounded_rect(canvas, 8, y, 185, y + 32, 12, fill="#3576c0", outline="", tags=(output_tag,))
+        canvas.create_text(20, y + 16, text="＋  Результат", anchor="w", fill="white",
                            font=("Segoe UI", 9, "bold"), tags=(output_tag,))
         canvas.tag_bind(output_tag, "<ButtonPress-1>", lambda _event: self.add_formula_output_from_palette())
         y += 40
-        canvas.create_text(8, y + 2, text="ПКМ в поле — все команды", anchor="w", fill="#98a1aa",
+        canvas.create_text(10, y + 2, text="ПКМ на поле — все команды", anchor="w", fill="#98a1aa",
                            font=("Segoe UI", 8))
         canvas.configure(scrollregion=(0, 0, 195, y + 25))
 
     def draw_palette_operation(self, canvas, x1: float, y1: float, x2: float, y2: float,
                                operation: str, tag: str) -> None:
-        """Небольшая зелёная Scratch-капсула в палитре операций."""
-        self.rounded_rect(canvas, x1, y1, x2, y2, 14, fill="#49a942", outline="#2f8738", tags=(tag,))
+        """Короткая, но читаемая карточка операции в библиотеке."""
+        self.rounded_rect(canvas, x1 + 2, y1 + 2, x2 + 2, y2 + 2, 13, fill="#d8e7df", outline="",
+                          tags=("palette_shadow",))
+        self.rounded_rect(canvas, x1, y1, x2, y2, 13, fill="#eaf8f0", outline="#b7e1c7", tags=(tag,))
         if operation in self._UNARY_OPERATIONS:
             self.rounded_rect(canvas, x1 + 7, y1 + 7, x1 + 31, y2 - 7, 10,
-                              fill="#ffffff", outline="#2f8738", tags=(tag,))
-            canvas.create_text(x1 + 56, (y1 + y2) / 2, text=operation, fill="white",
+                              fill="#ffffff", outline="#76bb93", tags=(tag,))
+            canvas.create_text(x1 + 56, (y1 + y2) / 2, text=operation, fill="#24744c",
                                font=("Segoe UI", 10, "bold"), tags=(tag,))
         else:
             self.rounded_rect(canvas, x1 + 6, y1 + 7, x1 + 28, y2 - 7, 9,
-                              fill="#ffffff", outline="#2f8738", tags=(tag,))
+                              fill="#ffffff", outline="#76bb93", tags=(tag,))
             self.rounded_rect(canvas, x2 - 28, y1 + 7, x2 - 6, y2 - 7, 9,
-                              fill="#ffffff", outline="#2f8738", tags=(tag,))
-            canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=operation, fill="white",
+                              fill="#ffffff", outline="#76bb93", tags=(tag,))
+            canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=operation, fill="#24744c",
                                font=("Segoe UI", 11, "bold"), tags=(tag,))
 
     @staticmethod
@@ -2741,9 +3015,28 @@ class SpectrumApp(_RootWindow):
                   x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1]
         return canvas.create_polygon(points, smooth=True, splinesteps=12, **kwargs)
 
+    def draw_formula_shadow(self, x: float, y: float, width: float, height: float, radius: float = 12) -> None:
+        """Лёгкая тень отделяет блок от сетки, не перехватывая клики мыши."""
+        self.rounded_rect(
+            self.formula_canvas, x + 2, y + 3, x + width + 2, y + height + 3, radius,
+            fill="#d7e0eb", outline="", tags=("formula_shadow",),
+        )
+
+    def formula_input_is_connected(self, block_id: int, index: int | None) -> bool:
+        block = self.formula_blocks.get(block_id)
+        if block is None:
+            return False
+        if block.get("kind") == "operation":
+            inputs = list(block.get("inputs", []))
+            value = inputs[index] if isinstance(index, int) and 0 <= index < len(inputs) else None
+        else:
+            value = block.get("input")
+        return isinstance(value, int) and value in self.formula_blocks
+
     def add_formula_block(self, kind: str, x: float, y: float, *, integral_id: int | None = None,
                           operation: str | None = None, value: float | None = None,
                           name: str | None = None, area_number: int | None = None) -> int:
+        previous = self.capture_formula_state()
         block_id = self._next_formula_id
         self._next_formula_id += 1
         unary = operation in self._UNARY_OPERATIONS
@@ -2765,6 +3058,9 @@ class SpectrumApp(_RootWindow):
             "name": output_name if auto_name else (name or ""), "auto_name": auto_name,
         }
         self.render_formula_blocks()
+        labels = {"area": "добавлена площадь", "constant": "добавлена константа",
+                  "operation": "добавлена операция", "output": "добавлен результат"}
+        self.remember_formula_state(previous, labels.get(kind, "добавлен блок"))
         return block_id
 
     def formula_spawn_point(self) -> tuple[float, float]:
@@ -2810,12 +3106,32 @@ class SpectrumApp(_RootWindow):
     def render_formula_blocks(self) -> None:
         canvas = self.formula_canvas
         canvas.delete("formula_item")
+        canvas.delete("formula_shadow")
+        canvas.delete("formula_empty")
         canvas.delete("wire_preview")
         canvas.delete("selection_outline")
         # Если перерисовка произошла во время смены инструмента, временная
         # рамка также не должна превращаться в постоянный пунктир.
         if self._selection_drag is None:
             canvas.delete("selection_marquee")
+        if not self.formula_blocks and not self.formula_comments:
+            center_x = float(canvas.canvasx(max(1, canvas.winfo_width()) / 2))
+            center_y = float(canvas.canvasy(max(1, canvas.winfo_height()) / 2))
+            left, top = center_x - 178, center_y - 74
+            self.rounded_rect(canvas, left + 3, top + 4, left + 363, top + 142, 18,
+                              fill="#dbe5f0", outline="", tags=("formula_empty",))
+            self.rounded_rect(canvas, left, top, left + 360, top + 138, 18,
+                              fill="#ffffff", outline="#dbe5f0", tags=("formula_empty",))
+            canvas.create_text(center_x, top + 37, text="Соберите первый расчёт", fill="#24344d",
+                               font=("Segoe UI", 13, "bold"), tags=("formula_empty",))
+            canvas.create_text(center_x, top + 69,
+                               text="1. Добавьте интеграл   2. Соедините операцию   3. Добавьте результат",
+                               fill="#718096", font=("Segoe UI", 9), tags=("formula_empty",))
+            canvas.create_text(center_x, top + 102, text="V — выделение   C — комментарий   Ctrl+Z — отмена",
+                               fill="#2e6ac1", font=("Segoe UI", 8, "bold"), tags=("formula_empty",))
+            self.update_formula_health()
+            self.refresh_result_panel()
+            return
         # Развёрнутый фрейм рисуется первым: его рамка остаётся под блоками и
         # не перекрывает ни сами блоки, ни соединения.
         self.draw_expanded_formula_frames()
@@ -2837,19 +3153,27 @@ class SpectrumApp(_RootWindow):
                     "#7b61ff" if kind == "constant" else "#9aa5b1"
                 if kind == "area":
                     width, height = self.formula_block_size(block)
-                    self.rounded_rect(canvas, x, y, x + width, y + height, 9, fill=color, outline="", tags=body_tag)
+                    self.draw_formula_shadow(x, y, width, height, 10)
+                    self.rounded_rect(canvas, x, y, x + width, y + height, 10, fill=color, outline="#ffffff", width=1,
+                                      tags=body_tag)
                     canvas.create_text(x + width / 2, y + height / 2, text=self.formula_area_number(block),
                                        fill="white", font=("Segoe UI", 14, "bold"), tags=body_tag)
                 else:
                     width, height = self.formula_block_size(block)
-                    self.rounded_rect(canvas, x, y, x + width, y + height, 10, fill=color, outline="", tags=body_tag)
+                    self.draw_formula_shadow(x, y, width, height, 10)
+                    self.rounded_rect(canvas, x, y, x + width, y + height, 10, fill=color, outline="#ffffff", width=1,
+                                      tags=body_tag)
                     canvas.create_text(x + width / 2, y + height / 2,
                                        text=self.format_formula_value(self.formula_value(block_id)), fill="white",
                                        font=("Consolas", 10, "bold"), tags=body_tag)
                 self.draw_formula_port(block_id, "out", None)
             elif kind == "operation":
                 operation = str(block["operation"])
-                self.rounded_rect(canvas, x, y, x + 88, y + 64, 16, fill="#48a942", outline="#2d8734", tags=body_tag)
+                state, _message = self.formula_block_diagnostic(block_id)
+                outline = "#f1a21a" if state == "warning" else "#d94b63" if state == "error" else "#197a4d"
+                fill = "#3ca36c" if state != "error" else "#c86475"
+                self.draw_formula_shadow(x, y, 88, 64, 16)
+                self.rounded_rect(canvas, x, y, x + 88, y + 64, 16, fill=fill, outline=outline, width=2, tags=body_tag)
                 canvas.create_text(x + 44, y + 32, text=operation, fill="white",
                                    font=("Segoe UI", 20, "bold"), tags=body_tag)
                 for index in range(len(block["inputs"])):
@@ -2857,7 +3181,11 @@ class SpectrumApp(_RootWindow):
                 self.draw_formula_port(block_id, "out", None)
             else:
                 width, height = self.formula_block_size(block)
-                self.rounded_rect(canvas, x, y, x + width, y + height, 15, fill="#3d7ea6", outline="#275a7a", tags=body_tag)
+                state, _message = self.formula_block_diagnostic(block_id)
+                outline = "#f1a21a" if state == "warning" else "#d94b63" if state == "error" else "#205b9c"
+                fill = "#3b7dc5" if state != "error" else "#c86475"
+                self.draw_formula_shadow(x, y, width, height, 15)
+                self.rounded_rect(canvas, x, y, x + width, y + height, 15, fill=fill, outline=outline, width=2, tags=body_tag)
                 canvas.create_text(x + width / 2, y + height / 2, text=str(block.get("name") or "Вывод"),
                                    fill="white", font=("Segoe UI", 9, "bold"), tags=body_tag)
                 self.draw_formula_port(block_id, "in", 0)
@@ -2870,11 +3198,12 @@ class SpectrumApp(_RootWindow):
             if block_id in self.selected_formula_blocks:
                 width, height = self.formula_block_size(block)
                 canvas.create_rectangle(x - 4, y - 4, x + width + 4, y + height + 4,
-                                        outline="#3179c7", width=2, dash=(4, 2), tags="selection_outline")
+                                        outline="#2563eb", width=2, tags="selection_outline")
         # Свёрнутый фрейм показывается поверх проводов, чтобы его порты были
         # легко различимы и за них можно было тянуть соединения.
         self.draw_collapsed_formula_frames()
         self.render_formula_comments()
+        self.update_formula_health()
         self.refresh_result_panel()
 
     def render_formula_comments(self) -> None:
@@ -2897,7 +3226,8 @@ class SpectrumApp(_RootWindow):
         if self.formula_tool == "comment":
             return "break"
         x, y = self.formula_canvas.canvasx(event.x), self.formula_canvas.canvasy(event.y)
-        self._comment_drag = {"id": comment_id, "x": float(x), "y": float(y)}
+        self._comment_drag = {"id": comment_id, "x": float(x), "y": float(y),
+                              "history": self.capture_formula_state()}
         return "break"
 
     def drag_formula_comment(self, event) -> str | None:
@@ -2915,7 +3245,10 @@ class SpectrumApp(_RootWindow):
     def drop_formula_comment(self, _event) -> str | None:
         if self._comment_drag is None:
             return None
+        previous = self._comment_drag.get("history")
         self._comment_drag = None
+        if isinstance(previous, dict):
+            self.remember_formula_state(previous, "перемещён комментарий")
         return "break"
 
     def formula_comment_menu(self, event, comment_id: int) -> str:
@@ -2934,12 +3267,17 @@ class SpectrumApp(_RootWindow):
             return
         text = simpledialog.askstring("Комментарий", "Текст комментария:", initialvalue=str(comment["text"]), parent=self)
         if text and text.strip():
+            previous = self.capture_formula_state()
             comment["text"] = text.strip()
             self.render_formula_blocks()
+            self.remember_formula_state(previous, "изменён комментарий")
 
     def delete_formula_comment(self, comment_id: int) -> None:
-        self.formula_comments.pop(comment_id, None)
-        self.render_formula_blocks()
+        if comment_id in self.formula_comments:
+            previous = self.capture_formula_state()
+            self.formula_comments.pop(comment_id, None)
+            self.render_formula_blocks()
+            self.remember_formula_state(previous, "удалён комментарий")
 
     @staticmethod
     def formula_block_size(block: dict[str, object]) -> tuple[float, float]:
@@ -3014,8 +3352,10 @@ class SpectrumApp(_RootWindow):
         x, y = self.formula_port_position(block_id, direction, index)
         suffix = "out" if direction == "out" else f"in_{index}"
         tag = f"port_{block_id}_{suffix}"
-        color = "#f3a530" if direction == "out" else "#4285c5"
-        canvas.create_oval(x - 6, y - 6, x + 6, y + 6, fill="#ffffff", outline=color, width=2,
+        missing_input = direction == "in" and not self.formula_input_is_connected(block_id, index)
+        color = "#f3a530" if direction == "out" else "#f1a21a" if missing_input else "#4285c5"
+        fill = "#fff8e7" if missing_input else "#ffffff"
+        canvas.create_oval(x - 6, y - 6, x + 6, y + 6, fill=fill, outline=color, width=2,
                            tags=("formula_item", f"block_{block_id}", "formula_port", tag))
         if direction == "out":
             canvas.tag_bind(tag, "<ButtonPress-1>",
@@ -3023,8 +3363,8 @@ class SpectrumApp(_RootWindow):
         else:
             canvas.tag_bind(tag, "<ButtonPress-1>",
                             lambda event, bid=block_id, idx=index: self.start_formula_wire(event, bid, "in", idx))
-        canvas.tag_bind(tag, "<Enter>", lambda _event, item=tag: canvas.itemconfigure(item, fill="#fff4cf"))
-        canvas.tag_bind(tag, "<Leave>", lambda _event, item=tag: canvas.itemconfigure(item, fill="#ffffff"))
+        canvas.tag_bind(tag, "<Enter>", lambda _event, item=tag: canvas.itemconfigure(item, fill="#fff1bd"))
+        canvas.tag_bind(tag, "<Leave>", lambda _event, item=tag, value=fill: canvas.itemconfigure(item, fill=value))
 
     def draw_formula_frame_port(self, frame_id: int, direction: str, index: int,
                                 endpoint_id: int | None, endpoint_index: int | None = None) -> None:
@@ -3101,11 +3441,11 @@ class SpectrumApp(_RootWindow):
                     continue
                 key = self.formula_wire_key(target_id, index)
                 points = self.formula_wire_points(source_id, target_id, index)
-                canvas.create_line(*points, fill=self.formula_wire_color(source_id), width=2, joinstyle="round",
+                canvas.create_line(*points, fill=self.formula_wire_color(source_id), width=1.5, joinstyle="round",
                                    tags=("formula_item", "formula_wire", f"wire_line_{key}"))
                 middle_x, middle_y = self.formula_wire_handle_position(source_id, target_id, index)
                 handle_tag = f"wire_handle_{key}"
-                canvas.create_rectangle(middle_x - 4, middle_y - 4, middle_x + 4, middle_y + 4,
+                canvas.create_rectangle(middle_x - 3, middle_y - 3, middle_x + 3, middle_y + 3,
                                         fill="#ffffff", outline=self.formula_wire_color(source_id), width=1,
                                         tags=("formula_item", "formula_wire", "wire_handle", handle_tag))
                 canvas.tag_bind(handle_tag, "<ButtonPress-1>",
@@ -3131,6 +3471,7 @@ class SpectrumApp(_RootWindow):
         target = self.formula_blocks.get(target_id)
         if target is None:
             return
+        previous = self.capture_formula_state()
         if target["kind"] == "operation" and 0 <= index < len(target.get("inputs", [])):
             target["inputs"][index] = None
         elif target["kind"] == "output" and index == 0:
@@ -3140,6 +3481,7 @@ class SpectrumApp(_RootWindow):
         self.wire_routes.pop(self.formula_wire_key(target_id, index), None)
         self.formula_status.set("Провод отсоединён.")
         self.render_formula_blocks()
+        self.remember_formula_state(previous, "отсоединён провод")
 
     def formula_block_label(self, block_id: object) -> str:
         if not isinstance(block_id, int) or block_id not in self.formula_blocks:
@@ -3263,10 +3605,12 @@ class SpectrumApp(_RootWindow):
                 return "break"
             if block_id not in self.selected_formula_blocks:
                 self.selected_formula_blocks = {block_id}
-            self._formula_drag = {"id": block_id, "x": float(x), "y": float(y), "group": True}
+            self._formula_drag = {"id": block_id, "x": float(x), "y": float(y), "group": True,
+                                  "history": self.capture_formula_state()}
             self.render_formula_blocks()
             return "break"
-        self._formula_drag = {"id": block_id, "x": float(x), "y": float(y)}
+        self._formula_drag = {"id": block_id, "x": float(x), "y": float(y),
+                              "history": self.capture_formula_state()}
         self.formula_canvas.tag_raise(f"block_{block_id}")
         return "break"
 
@@ -3317,10 +3661,13 @@ class SpectrumApp(_RootWindow):
     def drop_formula_block(self, event) -> str | None:
         if self._formula_drag is None:
             return None
+        previous = self._formula_drag.get("history")
         self._formula_drag = None
         # После перемещения блока проводки и порты перестраиваются по новой
         # геометрии; соединение создаётся только через сами порты.
         self.render_formula_blocks()
+        if isinstance(previous, dict):
+            self.remember_formula_state(previous, "перемещён блок")
         return "break"
 
     def formula_port_under_cursor(self, x: float, y: float, direction: str) -> tuple[int, int | None] | None:
@@ -3400,6 +3747,7 @@ class SpectrumApp(_RootWindow):
         self.draw_wire_preview(float(x), float(y))
 
     def connect_formula_wire(self, source_id: int, target_id: int, index: int) -> None:
+        previous = self.capture_formula_state()
         target = self.formula_blocks[target_id]
         if target["kind"] == "operation":
             target["inputs"][index] = source_id
@@ -3408,6 +3756,7 @@ class SpectrumApp(_RootWindow):
         self.wire_routes.pop(self.formula_wire_key(target_id, index), None)
         self.formula_status.set("Провод подключён — результат пересчитан.")
         self.render_formula_blocks()
+        self.remember_formula_state(previous, "подключён провод")
 
     def drop_formula_wire(self, event) -> None:
         if self._wire_drag is None:
@@ -3435,7 +3784,8 @@ class SpectrumApp(_RootWindow):
         self.connect_formula_wire(source_id, target_id, index)
 
     def start_wire_handle_drag(self, event, target_id: int, index: int) -> None:
-        self._wire_handle_drag = {"target_id": target_id, "index": index}
+        self._wire_handle_drag = {"target_id": target_id, "index": index,
+                                  "history": self.capture_formula_state()}
 
     def drag_wire_handle(self, event) -> None:
         if self._wire_handle_drag is None:
@@ -3453,10 +3803,15 @@ class SpectrumApp(_RootWindow):
             return
         points = self.formula_wire_points(source_id, target_id, index)
         self.formula_canvas.coords(f"wire_line_{key}", *points)
-        self.formula_canvas.coords(f"wire_handle_{key}", route[0] - 4, route[1] - 4, route[0] + 4, route[1] + 4)
+        self.formula_canvas.coords(f"wire_handle_{key}", route[0] - 3, route[1] - 3, route[0] + 3, route[1] + 3)
 
     def drop_wire_handle(self, _event) -> None:
+        if self._wire_handle_drag is None:
+            return
+        previous = self._wire_handle_drag.get("history")
         self._wire_handle_drag = None
+        if isinstance(previous, dict):
+            self.remember_formula_state(previous, "изменён маршрут провода")
 
     def formula_depends_on(self, block_id: int, searched_id: int, seen: set[int] | None = None) -> bool:
         """Проверка циклов: источник не может зависеть от будущего получателя."""
@@ -3595,16 +3950,20 @@ class SpectrumApp(_RootWindow):
         current = float(self.formula_blocks[block_id]["value"])
         value = self.ask_formula_number("Константа", "Новое значение:", current)
         if value is not None:
+            previous = self.capture_formula_state()
             self.formula_blocks[block_id]["value"] = value
             self.refresh_formula_workspace()
+            self.remember_formula_state(previous, "изменена константа")
 
     def rename_formula_output(self, block_id: int) -> None:
         current = str(self.formula_blocks[block_id].get("name") or "Вывод")
         name = simpledialog.askstring("Вывод", "Название карточки результата:", initialvalue=current, parent=self)
         if name and name.strip():
+            previous = self.capture_formula_state()
             self.formula_blocks[block_id]["name"] = name.strip()
             self.formula_blocks[block_id]["auto_name"] = False
             self.render_formula_blocks()
+            self.remember_formula_state(previous, "переименован результат")
 
     def renumber_formula_outputs(self) -> None:
         """Автоматические имена нумеруются только среди блоков вывода."""
@@ -3617,6 +3976,7 @@ class SpectrumApp(_RootWindow):
         block = self.formula_blocks.get(block_id)
         if block is None:
             return
+        previous = self.capture_formula_state()
         if block["kind"] == "operation":
             block["inputs"] = [None for _ in block["inputs"]]
             for index in range(len(block["inputs"])):
@@ -3625,6 +3985,7 @@ class SpectrumApp(_RootWindow):
             block["input"] = None
             self.wire_routes.pop(self.formula_wire_key(block_id, 0), None)
         self.render_formula_blocks()
+        self.remember_formula_state(previous, "отсоединены входы блока")
 
     def duplicate_formula_block(self, block_id: int) -> None:
         block = self.formula_blocks.get(block_id)
@@ -3643,6 +4004,9 @@ class SpectrumApp(_RootWindow):
         self.render_formula_blocks()
 
     def delete_formula_block(self, block_id: int) -> None:
+        if block_id not in self.formula_blocks:
+            return
+        previous = self.capture_formula_state()
         self.formula_blocks.pop(block_id, None)
         self.renumber_formula_outputs()
         for block in self.formula_blocks.values():
@@ -3653,6 +4017,7 @@ class SpectrumApp(_RootWindow):
         self.cleanup_formula_frames()
         self.cleanup_wire_routes()
         self.refresh_formula_workspace()
+        self.remember_formula_state(previous, "удалён блок")
 
     def cleanup_wire_routes(self) -> None:
         """Убрать маршруты, для которых после удаления больше нет связи."""
@@ -3865,6 +4230,7 @@ class SpectrumApp(_RootWindow):
             elif block["kind"] == "output":
                 raw_input = raw.get("input")
                 block["input"] = id_map.get(raw_input) if isinstance(raw_input, int) else None
+        previous = self.capture_formula_state() if show_error else None
         self.formula_blocks = new_blocks
         self._next_formula_id = max(new_blocks) + 1
         self.selected_formula_blocks.clear()
@@ -3949,18 +4315,26 @@ class SpectrumApp(_RootWindow):
         if skipped:
             note += f" Пропущено блоков: {skipped}."
         self.formula_status.set(note)
+        if isinstance(previous, dict):
+            self.remember_formula_state(previous, "загружен пресет формул")
         return True
 
     def refresh_result_panel(self) -> None:
         if not hasattr(self, "result_panel"):
             return
+        theme = self.formula_theme
         for child in self.result_panel.winfo_children():
             child.destroy()
         self.formula_results_table = None
         outputs = [(block_id, block) for block_id, block in self.formula_blocks.items() if block["kind"] == "output"]
         if not outputs:
-            tk.Label(self.result_panel, text="Добавьте блок\n«Карточка результата»", bg="#ffffff",
-                     fg="#98a1aa", justify="left").pack(anchor="w", padx=4, pady=4)
+            empty = tk.Frame(self.result_panel, bg="#f5f8fc", highlightbackground="#dce5f0", highlightthickness=1,
+                             padx=10, pady=10)
+            empty.pack(fill="x", pady=(0, 7))
+            tk.Label(empty, text="Нет результата", bg="#f5f8fc", fg="#40516a",
+                     font=("Segoe UI", 10, "bold"), anchor="w").pack(fill="x")
+            tk.Label(empty, text="Добавьте карточку «Результат»\nи подключите её к схеме.", bg="#f5f8fc",
+                     fg="#7a8799", justify="left", anchor="w", font=("Segoe UI", 8)).pack(fill="x", pady=(4, 0))
             return
         # Для схемы, собранной на обзорном графике, отдельное число «Вывод»
         # неоднозначно: оно относится лишь к активной строке. Показываем
@@ -3981,26 +4355,38 @@ class SpectrumApp(_RootWindow):
             for number, (block_id, block) in enumerate(outputs, start=1):
                 name = str(block.get("name") or ("Вывод" if number == 1 else f"Вывод {number}"))
                 value = self.formula_value(block_id)
-                card = tk.Frame(self.result_panel, bg="#eff8ff", highlightbackground="#b7d5e8", highlightthickness=1,
-                                padx=8, pady=7)
+                state, diagnostic = self.formula_block_diagnostic(block_id)
+                palette = {
+                    "ready": ("#eefbf4", "#b9e7ca", "#25784e", "Готово"),
+                    "warning": ("#fff9eb", "#f6d37e", "#94620c", "Нужен вход"),
+                    "error": ("#fff1f3", "#f4bdc7", "#a1364a", "Проверьте схему"),
+                }
+                bg, border, accent, badge = palette[state]
+                card = tk.Frame(self.result_panel, bg=bg, highlightbackground=border, highlightthickness=1,
+                                padx=10, pady=9)
                 card.pack(fill="x", pady=(0, 7))
-                tk.Label(card, text=name, bg="#eff8ff", fg="#35617d", anchor="w",
-                         font=("Segoe UI", 9, "bold")).pack(fill="x")
-                value_row = tk.Frame(card, bg="#eff8ff")
+                title_row = tk.Frame(card, bg=bg)
+                title_row.pack(fill="x")
+                tk.Label(title_row, text=name, bg=bg, fg="#40516a", anchor="w",
+                         font=("Segoe UI", 9, "bold")).pack(side="left", fill="x", expand=True)
+                tk.Label(title_row, text=badge, bg=bg, fg=accent, anchor="e",
+                         font=("Segoe UI", 8, "bold")).pack(side="right")
+                value_row = tk.Frame(card, bg=bg)
                 value_row.pack(fill="x", pady=(4, 0))
-                tk.Label(value_row, text=self.format_formula_value(value), bg="#eff8ff", fg="#153f59",
+                tk.Label(value_row, text=self.format_formula_value(value), bg=bg, fg="#153f59",
                          font=("Consolas", 13, "bold"), anchor="w").pack(side="left", fill="x", expand=True)
-                tk.Button(value_row, text="Копировать", command=lambda v=value: self.copy_formula_value(v),
-                          padx=4, pady=1).pack(side="right")
+                if state != "ready":
+                    tk.Label(card, text=diagnostic, bg=bg, fg=accent, anchor="w",
+                             font=("Segoe UI", 8)).pack(fill="x", pady=(5, 0))
 
         if multi_result:
-            result_header = tk.Frame(self.result_panel, bg="#ffffff")
+            result_header = tk.Frame(self.result_panel, bg=theme["panel"])
             result_header.pack(fill="x", pady=(0, 4))
-            tk.Label(result_header, text="Результаты по спектрам", bg="#ffffff", fg="#536171",
-                     font=("Segoe UI", 9, "bold")).pack(side="left")
+            tk.Label(result_header, text="РЕЗУЛЬТАТЫ ПО СПЕКТРАМ", bg=theme["panel"], fg="#617086",
+                     font=("Segoe UI", 8, "bold")).pack(side="left")
             columns = tuple(f"out_{block_id}" for block_id, _block in outputs)
             table = ttk.Treeview(self.result_panel, columns=("spectrum",) + columns, show="headings",
-                                 height=min(6, len(comparison_spectrum_ids)), selectmode="extended")
+                                 height=min(7, len(comparison_spectrum_ids)), selectmode="extended", style="Formula.Treeview")
             table.heading("spectrum", text="Спектр")
             table.column("spectrum", width=105, anchor="w", stretch=True)
             for number, (block_id, block) in enumerate(outputs, start=1):
@@ -4008,21 +4394,17 @@ class SpectrumApp(_RootWindow):
                 column = f"out_{block_id}"
                 table.heading(column, text=name)
                 table.column(column, width=78, anchor="center", stretch=True)
-            for spectrum_id in comparison_spectrum_ids:
+            for row_number, spectrum_id in enumerate(comparison_spectrum_ids):
                 record = self.spectra[spectrum_id]
                 values = [str(record["name"])]
                 values.extend(self.format_formula_value(self.formula_value_for_record(block_id, record))
                               for block_id, _block in outputs)
-                table.insert("", "end", values=values)
+                table.insert("", "end", values=values, tags=("even" if row_number % 2 == 0 else "odd",))
+            table.tag_configure("even", background="#f8fbff")
+            table.tag_configure("odd", background="#eef4fb")
             self.formula_results_table = table
             table.bind("<Control-KeyPress>", self.copy_formula_results_table_shortcut)
             table.pack(fill="x", pady=(0, 4))
-
-    def copy_formula_value(self, value: float | None) -> None:
-        if value is None:
-            return
-        self.clipboard_clear()
-        self.clipboard_append(self.format_formula_value(value))
 
     def copy_formula_results_table(self, _event=None) -> str:
         """Скопировать результаты формулы по спектрам в Excel-совместимый TSV."""
